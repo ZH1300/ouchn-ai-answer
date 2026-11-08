@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         国开 LMS AI 答案解析助手
+// @name         国开 LMS AI 答案解析助手（加密存储 · 可拖动缩放）
 // @namespace    https://lms.ouchn.cn/
-// @version      4.4
-// @description  获取国开 LMS 考试题目，调用 DeepSeek 生成答案并展示；支持单选/多选/判断/填空/简答/程序题；面板可拖动缩放；API Key 主密码加密存储，会话缓存二次加密；内存精简
+// @version      4.5
+// @description  获取国开 LMS 考试题目，调用 DeepSeek 生成答案并展示；支持单选/多选/判断/填空/简答/程序题；低 token 高准确请求；面板可拖动缩放；API Key 主密码加密存储，会话缓存二次加密
 // @author       https://github.com/ZH1300/
 // @match        https://lms.ouchn.cn/exam/*
 // @match        https://lms.ouchn.cn/api/exams/*
@@ -747,64 +747,88 @@
         return found;
     }
 
-    // ==================== Prompt & AI ====================
+    // ==================== Prompt & AI（低 token + 高准确） ====================
+
+    /** 按题型限制输出长度，从源头封顶 output token */
+    function getMaxTokens(q) {
+        switch (q.type) {
+            case 'single_selection':
+            case 'multiple_selection':
+            case 'true_or_false':
+                return 30;
+            case 'fill_in_blank':
+            case 'fill_blank':
+                return 100;
+            case 'short_answer':
+                if (/编写|编程|设计.{0,4}程序/.test(q.content)) return 1200;
+                return 400;
+            case 'essay':
+                return 500;
+            default:
+                return 300;
+        }
+    }
+
+    /** 极简 prompt：单条 user、按题型定制、短键 a、示例约束 */
     function buildPrompt(q) {
-        let typeHint = '根据题目作答';
-        let formatHint = '{"answer": "你的答案"}';
+        const optLine = q.options.length
+            ? '选项:' + q.options.map(o => o.key + '.' + o.text).join(' ')
+            : '';
 
         switch (q.type) {
             case 'single_selection':
-                typeHint = '单选题，answer 填一个选项字母，例如 "B"';
-                formatHint = '{"answer": "B"}';
-                break;
+                return `只输出json如{"a":"B"}，a为一个选项字母。\n${q.content}\n${optLine}`;
+
             case 'multiple_selection':
-                typeHint = '多选题，answer 填全部正确选项字母连写，例如 "ACD"';
-                formatHint = '{"answer": "ACD"}';
-                break;
+                return `只输出json如{"a":"ABC"}，a为所有正确选项字母(无分隔符)。\n${q.content}\n${optLine}`;
+
             case 'true_or_false':
-                typeHint = '判断题，answer 必须严格填 "正确" 或 "错误" 这两个词之一，不要填字母';
-                formatHint = '{"answer": "正确"}';
-                break;
+                return `只输出json如{"a":"对"}，a只能为"对"或"错"。\n${q.content}`;
+
             case 'fill_in_blank':
             case 'fill_blank': {
                 const n = q.blankCount || 1;
-                typeHint = `填空题，题干中的【空1】…【空${n}】表示需要填写的空位。请按空位顺序给出每个空的答案，答案要简洁准确。`;
-                formatHint = n > 1
-                    ? `{"answer": ["第1空答案", "第2空答案", ..., "第${n}空答案"]}`
-                    : '{"answer": ["答案"]}';
-                break;
+                if (n === 1) {
+                    return `只输出json如{"a":["答案"]}，【空1】处填答案。\n${q.content}`;
+                }
+                return `只输出json如{"a":["答案1","答案2"]}，共${n}空，按【空N】顺序。\n${q.content}`;
             }
-            case 'short_answer':
-                typeHint = '简答题/程序题。请仔细阅读题干：若要求"写出运行结果"，只给出最终输出（保留输出中的空格和换行，不要加解释）；若要求"编写程序"，给出完整可编译的 C 代码；若要求分析函数功能，用简洁中文描述。';
-                formatHint = '{"answer": "答案文本或代码"}';
-                break;
+
+            case 'short_answer': {
+                // 自动识别三类程序/简答题
+                const askWrite = /编写|编程|设计.{0,4}程序/.test(q.content);
+                const askFunc = !askWrite && /功能|作用/.test(q.content);
+                const isCode = /#include|void\s+main|int\s+main/.test(q.content);
+                const askRun = !askWrite && !askFunc && (/输出|打印|运行结果/.test(q.content) || isCode);
+
+                if (askWrite) {
+                    return `只输出json如{"a":"#include<stdio.h>\\nint main(){...}"}，a为完整可编译的C源码(含#include与main)，不加解释。\n${q.content}`;
+                }
+                if (askFunc) {
+                    return `只输出json如{"a":"功能简述"}，a为函数功能的一句话中文说明(≤30字)。\n${q.content}`;
+                }
+                if (askRun) {
+                    return `只输出json如{"a":"15 20"}，a为程序实际输出的原文(空格原样保留，换行用\\n表示，不带"输出为:"等任何说明)。\n${q.content}`;
+                }
+                return `只输出json如{"a":"答案"}。\n${q.content}`;
+            }
+
             case 'essay':
-                typeHint = '论述题，answer 填写核心论点摘要';
-                formatHint = '{"answer": "核心论点摘要"}';
-                break;
+                return `只输出json如{"a":"要点"}。\n${q.content}`;
+
             default:
-                break;
+                return q.content;
         }
-
-        const optionText = q.options.length
-            ? q.options.map(o => `${o.key}. ${o.text}`).join('\n')
-            : '';
-
-        return `请独立解答以下题目，严格只输出 JSON，不要任何解释。
-${typeHint}
-
-题型：${q.typeLabel || q.type}${q.blankCount ? `（${q.blankCount}个空）` : ''}
-题干：${q.content}
-${optionText ? `选项：\n${optionText}\n` : ''}
-输出格式：${formatHint}`;
     }
 
     /**
      * 循环重试（避免递归叠加 Promise 闭包）：
      * - 网络错误、解析失败、429、5xx 可重试
      * - 其他 4xx 立即抛错
+     * - temperature=0 消除随机性
+     * - max_tokens 按题型封顶
      */
-    async function askAI(prompt) {
+    async function askAI(prompt, q) {
         if (!CONFIG.DEEPSEEK_API_KEY) throw new Error('未解锁 DeepSeek API Key');
         let lastErr = new Error('未知错误');
 
@@ -828,10 +852,10 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
                     data: JSON.stringify({
                         model: 'deepseek-chat',
                         messages: [
-                            { role: 'system', content: '你是一个严谨的答题助手，只输出 JSON，不要任何解释。' },
                             { role: 'user', content: prompt }
                         ],
-                        temperature: 0.1,
+                        temperature: 0,
+                        max_tokens: getMaxTokens(q),
                         response_format: { type: 'json_object' }
                     })
                 });
@@ -844,7 +868,10 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
                 const json = safeJson(res.responseText);
                 const raw = json?.choices?.[0]?.message?.content;
                 const parsed = safeJson(raw);
-                if (parsed && parsed.answer !== undefined) return parsed.answer;
+                if (parsed) {
+                    if (parsed.a !== undefined) return parsed.a;
+                    if (parsed.answer !== undefined) return parsed.answer;
+                }
                 lastErr = new Error('AI 返回无法解析');
                 continue;
             }
@@ -902,21 +929,23 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
 
         const s = String(answer).trim();
 
+        // 判断题：兼容 "对/错"、"正确/错误"、字母（按实际选项文本映射）
         if (q.type === 'true_or_false') {
-            if (/^(正确|对|是|true|t)$/i.test(s)) return '正确';
-            if (/^(错误|错|否|false|f)$/i.test(s)) return '错误';
+            if (/^(正确|对|是|true|t|√)$/i.test(s)) return '正确';
+            if (/^(错误|错|否|false|f|×)$/i.test(s)) return '错误';
             if (/^[A-Za-z]$/.test(s) && q.options.length) {
                 const opt = q.options.find(o => o.key === s.toUpperCase());
                 if (opt) {
                     const t = opt.text.trim();
-                    if (/^(正确|对|是|true|t)$/i.test(t)) return '正确';
-                    if (/^(错误|错|否|false|f)$/i.test(t)) return '错误';
+                    if (/^(正确|对|是|true|t|√)$/i.test(t)) return '正确';
+                    if (/^(错误|错|否|false|f|×)$/i.test(t)) return '错误';
                     return `${s.toUpperCase()}. ${t}`;
                 }
             }
             return s;
         }
 
+        // 选择题：字母 → 文本，未匹配标注
         if (q.type === 'single_selection' || q.type === 'multiple_selection') {
             if (/^[A-Za-z]+$/.test(s)) {
                 return s.toUpperCase().split('').map(k => {
@@ -959,7 +988,7 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
             .catch(() => alert('复制失败，请手动选择文本复制'));
     }
 
-    // ==================== 卡片样式（一次性注入，卡片用 class） ====================
+    // ==================== 卡片样式（一次性注入） ====================
     function ensureStyles() {
         if (document.getElementById('ai-answer-style')) return;
         const style = document.createElement('style');
@@ -1127,7 +1156,7 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
                 let formatted = null;
                 let errMsg = null;
                 try {
-                    const answer = await askAI(buildPrompt(q));
+                    const answer = await askAI(buildPrompt(q), q);
                     if (myToken !== runToken) return;
                     formatted = formatAnswerText(q, answer);
                 } catch (e) {
@@ -1334,7 +1363,7 @@ ${optionText ? `选项：\n${optionText}\n` : ''}
                  style="display:flex;justify-content:space-between;align-items:center;
                         padding:10px 12px;background:#181825;border-bottom:1px solid #313244;
                         cursor:move;user-select:none;flex-shrink:0;">
-                <strong style="color:#cba6f7;font-size:13px;">📝 国开 AI 答案解析 v4.4</strong>
+                <strong style="color:#cba6f7;font-size:13px;">📝 国开 AI 答案解析 v4.5</strong>
                 <div style="display:flex;gap:4px;">
                     <button id="ai-minimize" title="最小化"
                             style="background:none;border:none;color:#6c7086;cursor:pointer;font-size:14px;padding:0 2px;">—</button>
